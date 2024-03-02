@@ -1014,6 +1014,8 @@ mod content {
 mod tests {
     use std::{io::ErrorKind, process::ChildStdout};
 
+    use image::EncodableLayout;
+
     use {
         super::*,
         lazy_static::lazy_static,
@@ -1786,12 +1788,18 @@ mod tests {
 
         let stdout = std::mem::take(&mut *thread_data.stdout_bytes.lock().unwrap());
 
-        dbg!(stdout.len(), String::from_utf8(stdout).ok());
+        dbg!(stdout.len());
+
+        let mut file: std::fs::File = File::create("output/vim_out.txt").unwrap();
+
+        let stdout_string: String = format!("{:?}", String::from_utf8(stdout).unwrap_or_default());
+
+        file.write(stdout_string.as_bytes()).unwrap();
         // println!("{}", &stdout[..stdout.rfind('\n').unwrap()]);
     }
 
     #[test]
     fn test_vim_io() {
-        test_2023_02_01("./lines.txt");
+        test_2023_02_01("./examples/demo_ex.rs");
     }
 }
