@@ -5,9 +5,10 @@ use {
     clap::Parser,
     content::*,
     image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageError, ImageResult},
+    parse::into_tokens,
     std::{
         fmt::{Debug, Formatter, Result as FmtResult},
-        fs::{create_dir_all, read, read_to_string, write},
+        fs::read,
         io::Error as IoError,
         iter::Peekable,
         mem::MaybeUninit,
@@ -18,43 +19,528 @@ use {
         str::from_utf8_unchecked,
     },
     ttf_parser::{Face, FaceParsingError},
+    write::try_write_example,
 };
+
+#[macro_use]
+mod content;
+
+/// Code for parsing writable tokens that can freely have whitespace inserted between them. This
+/// its used by `TextBuffer::write_tokens` to tightly pack tokens, filling as much of the line as
+/// possible. Note that due to the many robustness errors in this code, it is not intended to be
+/// used as is outside of this project to parse what it claims to be able to parse at face value:
+/// the many known constraints and limitations of it work for this use case because it only needs
+/// to work for the static text that is the `content` module.
+mod parse {
+    use nom::{
+        branch::alt,
+        bytes::complete::{tag, take, take_until, take_while, take_while1},
+        character::complete::{line_ending, not_line_ending, space0},
+        combinator::{iterator, map, recognize},
+        sequence::{preceded, terminated, tuple},
+        IResult,
+    };
+
+    /// Yields a single line.
+    fn parse_line(input: &str) -> IResult<&str, &str> {
+        map(
+            tuple((space0, not_line_ending, line_ending)),
+            |(_, line, _)| line,
+        )(input)
+    }
+
+    /// Yields a `str` that doesn't contain `'"'`.
+    fn parse_quoteless_str(input: &str) -> IResult<&str, &str> {
+        take_while(|c: char| c != '"')(input)
+    }
+
+    /// Yields a string literal.
+    fn parse_string_literal(input: &str) -> IResult<&str, &str> {
+        recognize(tuple((tag("\""), parse_quoteless_str, tag("\""))))(input)
+    }
+
+    /// Yields a char literal. Note that this doesn't properly handle `'\''`. This also will eat
+    /// invalid char literals that contain multiple characters between the `'`s.
+    fn parse_char_literal(input: &str) -> IResult<&str, &str> {
+        recognize(tuple((
+            tag("'"),
+            take_while1(|c: char| c != '\''),
+            tag("'"),
+        )))(input)
+    }
+
+    /// Yields a byte literal. Note that this doesn't properly handle `b'\''`. This also will eat
+    /// invalid byte literals that contain multiple characters between the `'`s.
+    fn parse_byte_literal(input: &str) -> IResult<&str, &str> {
+        recognize(tuple((tag("b"), parse_char_literal)))(input)
+    }
+
+    /// Yields a `/* block comment */`
+    fn parse_block_comment(input: &str) -> IResult<&str, &str> {
+        recognize(tuple((tag("/*"), take_until("*/"), tag("*/"))))(input)
+    }
+
+    /// Yields an identifier, a keyword, or a numeric literal. This will also yield invalid tokens
+    /// that start with a numeric character followed by characters that don't form a numeric literal
+    /// together (like `0foo`).
+    fn parse_identifier_keyword_or_numeric_literal(input: &str) -> IResult<&str, &str> {
+        take_while1(|c: char| c.is_ascii_alphanumeric() || c == '_')(input)
+    }
+
+    /// Yields a label or lifetime. Note that this must be processed after attempting
+    /// `parse_char_literal`. Due to the issues with `parse_identifier_keyword_or_numeric_literal`,
+    /// this will also match invalid labels.
+    fn parse_label_or_lifetime(input: &str) -> IResult<&str, &str> {
+        recognize(preceded(
+            tag("'"),
+            parse_identifier_keyword_or_numeric_literal,
+        ))(input)
+    }
+
+    /// Yields the smallest token that can be written without worrying about whitespace being
+    /// inserted.
+    fn parse_token(input: &str) -> IResult<&str, &str> {
+        macro_rules! alt_tags { ( $( $tag:literal ),+ ) => { alt(( $( tag($tag), )+ )) }; }
+
+        terminated(
+            alt((
+                // Parse multi-char operators. Taken from
+                // https://doc.rust-lang.org/book/appendix-02-operators.html.
+                alt((
+                    // 1. 3-char literals
+                    alt_tags!("..=", "<<=", ">>="),
+                    // 2. Bitshift
+                    alt_tags!("<<", ">>"),
+                    // 3. Comparison & boolean operation
+                    alt_tags!("==", "!=", "<=", ">=", "&&", "||"),
+                    // 4. Assignment
+                    alt_tags!("+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="),
+                    // 5. Other
+                    alt_tags!("::", "->", "=>", ".."),
+                )),
+                parse_string_literal,
+                parse_char_literal,
+                parse_byte_literal,
+                parse_block_comment,
+                parse_label_or_lifetime,
+                parse_identifier_keyword_or_numeric_literal,
+                take(1_usize),
+            )),
+            space0,
+        )(input)
+    }
+
+    pub fn into_tokens(input: &str) -> Vec<&str> {
+        let mut tokens: Vec<&str> = Vec::new();
+
+        for line in &mut iterator(input, parse_line).filter(|line| !line.is_empty()) {
+            for token in &mut iterator(line, parse_token) {
+                tokens.push(token);
+            }
+        }
+
+        tokens
+    }
+
+    #[test]
+    fn test_into_tokens() {
+        const TEST_INTO_TOKENS: &str = include_str!("../examples/test_into_tokens.rs");
+
+        assert_eq!(
+            into_tokens(TEST_INTO_TOKENS),
+            vec![
+                "fn",
+                "main",
+                "(",
+                ")",
+                "{",
+                "println",
+                "!",
+                "(",
+                "\"this is a literal inside a macro inside a func\"",
+                ")",
+                ";",
+                "let",
+                "x",
+                ":",
+                "i32",
+                "=",
+                "1",
+                ";",
+                "dbg",
+                "!",
+                "(",
+                "x",
+                ")",
+                ";",
+                "}",
+                "#",
+                "[",
+                "cfg",
+                "(",
+                "test",
+                ")",
+                "]",
+                "mod",
+                "test",
+                "{",
+                "#",
+                "[",
+                "test",
+                "]",
+                "fn",
+                "some_test_0",
+                "(",
+                ")",
+                "{",
+                "let",
+                "this_is_a_really_long_variable_name",
+                ":",
+                "i32",
+                "=",
+                "999999",
+                ";",
+                "let",
+                "my_str",
+                "=",
+                "\"this is a another str as well as the one in main()\"",
+                ";",
+                "println",
+                "!",
+                "(",
+                "\"{my_str} {this_is_a_really_long_variable_name}\"",
+                ")",
+                ";",
+                "println",
+                "!",
+                "(",
+                "\"{} {} {}\"",
+                ",",
+                "\"a\"",
+                ",",
+                "\"b\"",
+                ",",
+                "\"c\"",
+                ")",
+                ";",
+                "}",
+                "}"
+            ]
+        );
+    }
+}
+
+mod write {
+    use {
+        super::*,
+        chrono::prelude::*,
+        static_assertions::const_assert,
+        std::{
+            fs::{create_dir_all, read_dir, remove_file, write, DirEntry},
+            io::Write,
+        },
+    };
+
+    const CONTENT: &str = include_str!("content.rs");
+
+    const_assert!(CONTENT.is_ascii());
+
+    const EXAMPLES_PATH: &str = "./examples/";
+
+    const TAB_SIZE_IC: InsertionContext =
+        InsertionContext::new("const TAB_SIZE: usize = 4_usize;", 8_usize, 7_usize);
+    const IMAGE_TEXT_PATH_IC: InsertionContext =
+        InsertionContext::new(r#"const IMAGE_TEXT_PATH: &str = "";"#, 2_usize, 2_usize);
+    const OUTPUT_IMAGE_PATH_IC: InsertionContext = InsertionContext::new(
+        r#"const OUTPUT_IMAGE_PATH: &str = output_file!("");"#,
+        3_usize,
+        3_usize,
+    );
+    const BYTES_IC: InsertionContext =
+        InsertionContext::new(r#"const BYTES: &[u8] = br"";"#, 3_usize, 1_usize);
+
+    const END_COPY_SECTION_PATTERN: &str = "/* End copy section */";
+    #[derive(Default)]
+    struct TextBuffer {
+        bytes: Vec<u8>,
+        tab_size: usize,
+        column: usize,
+        end_column: usize,
+    }
+
+    impl TextBuffer {
+        const END_COMMENT: &'static str = " */";
+        const START_COMMENT: &'static str = "/*";
+
+        fn new(capacity: usize, tab_size: usize, end_column: usize) -> Self {
+            Self {
+                bytes: Vec::with_capacity(capacity),
+                tab_size,
+                column: 0_usize,
+                end_column,
+            }
+        }
+
+        fn write(&mut self, text: &str) {
+            self.bytes.reserve(text.len());
+
+            for byte in text.as_bytes().iter().copied() {
+                self.bytes.push(byte);
+
+                match byte {
+                    b'\t' => {
+                        self.column += self.tab_size - self.column % self.tab_size;
+                    }
+                    b'\n' => {
+                        self.column = 0_usize;
+                    }
+                    _ => {
+                        self.column += 1_usize;
+                    }
+                }
+            }
+        }
+
+        fn is_punctuation(byte: u8) -> bool {
+            let c: char = byte as char;
+
+            !c.is_ascii_alphanumeric() && c != '_'
+        }
+
+        fn write_token(&mut self, token: &str) {
+            if let Some((last_old_byte, first_new_byte)) = self
+                .bytes
+                .last()
+                .copied()
+                .zip(token.as_bytes().first().copied())
+            {
+                let is_continuing_comment: bool =
+                    self.bytes.ends_with(Self::END_COMMENT.as_bytes())
+                        && token.starts_with(Self::START_COMMENT);
+
+                let token: &str = if is_continuing_comment {
+                    self.bytes
+                        .truncate(self.bytes.len() - Self::END_COMMENT.len());
+                    self.column -= Self::END_COMMENT.len();
+
+                    &token[Self::START_COMMENT.len()..]
+                } else {
+                    token
+                };
+
+                let is_space_needed: bool = !is_continuing_comment
+                    && !Self::is_punctuation(last_old_byte)
+                    && !Self::is_punctuation(first_new_byte);
+
+                if self.column + is_space_needed as usize + token.len() <= self.end_column {
+                    if is_space_needed {
+                        self.write(" ");
+                    }
+
+                    self.write(token);
+                } else {
+                    self.write("\n");
+                    self.write(token);
+                }
+            } else {
+                self.write(token);
+            }
+        }
+
+        fn write_tokens(&mut self, text: &str) {
+            let mut comment_buffer: Vec<u8> = Vec::new();
+
+            for token in into_tokens(text) {
+                if token.starts_with(Self::START_COMMENT) && token.ends_with(Self::END_COMMENT) {
+                    for token in token
+                        [Self::START_COMMENT.len()..token.len() - Self::END_COMMENT.len()]
+                        .split_ascii_whitespace()
+                    {
+                        comment_buffer.clear();
+                        write!(&mut comment_buffer, "/* {token} */").ok();
+
+                        // SAFETY: `comment_buffer` only ever contains bytes written by the
+                        // `write!` macro.
+                        self.write_token(unsafe { from_utf8_unchecked(&comment_buffer) });
+                    }
+                } else {
+                    self.write_token(token);
+                }
+            }
+        }
+    }
+
+    struct InsertionContext {
+        /// The pattern to search for in `CONTENT`.
+        pattern: &'static str,
+
+        /// How many bytes from the end of the pattern should the insertion start.
+        start_insertion_trailing: usize,
+
+        /// How many bytes from the end of the pattern should the insertion end.
+        end_insertion_trailing: usize,
+    }
+
+    impl InsertionContext {
+        const fn new(
+            pattern: &'static str,
+            start_insertion_trailing: usize,
+            end_insertion_trailing: usize,
+        ) -> Self {
+            Self {
+                pattern,
+                start_insertion_trailing,
+                end_insertion_trailing,
+            }
+        }
+
+        fn write<'s, I: IntoIterator<Item = &'s str>>(
+            &self,
+            insertions: I,
+            text_buffer: &mut TextBuffer,
+        ) {
+            let start_pattern: usize = self.start_pattern();
+            let end_pattern: usize = start_pattern + self.pattern.len();
+            let start_insert: usize = end_pattern - self.start_insertion_trailing;
+            let end_insert: usize = end_pattern - self.end_insertion_trailing;
+
+            text_buffer.write(&CONTENT[start_pattern..start_insert]);
+
+            for insertion in insertions {
+                text_buffer.write(insertion);
+            }
+
+            text_buffer.write(&CONTENT[end_insert..end_pattern]);
+            text_buffer.write("\n");
+        }
+
+        fn start_pattern(&self) -> usize {
+            find_start_pattern(self.pattern)
+        }
+
+        fn end_pattern(&self) -> usize {
+            find_end_pattern(self.pattern)
+        }
+    }
+
+    fn remove_vim_txt_cache_files() {
+        for vim_txt_dir_entry in read_dir(output_file!())
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|dir_entry| dir_entry.ok())
+            .filter(|dir_entry| {
+                dir_entry
+                    .file_name()
+                    .to_str()
+                    .map_or(false, |file_name| file_name.ends_with(".vim.txt"))
+            })
+            .collect::<Vec<DirEntry>>()
+        {
+            remove_file(vim_txt_dir_entry.path()).ok();
+        }
+    }
+
+    fn find_start_pattern(pattern: &str) -> usize {
+        CONTENT.find(pattern).unwrap()
+    }
+
+    fn find_end_pattern(pattern: &str) -> usize {
+        find_start_pattern(pattern) + pattern.len()
+    }
+
+    fn get_signature() -> String {
+        let basic_signature: String = format!(
+            "github.com/ClydeHobart/drawing_hands, {}",
+            Local::now().date_naive().format("%Y-%m-%d")
+        );
+
+        Command::new("figlet")
+            .args(["-f", "slant", "-w", "500", &basic_signature])
+            .output()
+            .ok()
+            .and_then(|output| {
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8(output.stdout).ok())
+            })
+            .flatten()
+            .unwrap_or(basic_signature)
+    }
+
+    #[derive(Debug)]
+    pub enum WriteExampleError {
+        ImageBytesDataError(ImageBytesDataError),
+        InvalidExampleChar(char),
+        FailedToCreateDir(IoError),
+        FailedToWriteExample(IoError),
+    }
+
+    pub fn try_write_example(
+        font_path: &str,
+        image_path: &str,
+        example_name: &str,
+        tab_size: usize,
+    ) -> Result<(), WriteExampleError> {
+        use WriteExampleError as Error;
+
+        remove_vim_txt_cache_files();
+
+        let image_bytes_data: ImageBytesData =
+            ImageBytesData::try_from_file_paths(font_path, image_path)
+                .map_err(Error::ImageBytesDataError)?;
+
+        example_name
+            .chars()
+            .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_'))
+            .map_or(Ok(()), |c| Err(Error::InvalidExampleChar(c)))?;
+
+        create_dir_all(EXAMPLES_PATH).map_err(Error::FailedToCreateDir)?;
+
+        let example_path: String = format!("{EXAMPLES_PATH}{example_name}.rs");
+        let octothorpes: String = image_bytes_data.octothorpes_string();
+        let image_str: &str = image_bytes_data.bytes_str();
+
+        let mut text_buffer: TextBuffer = TextBuffer::new(
+            // This is an overestimate due to whitespace that'll get stripped
+            CONTENT.len() + image_str.len(),
+            4_usize,
+            ImageBytesData::LINE_BYTE_WIDTH,
+        );
+
+        text_buffer.write("// Generated by");
+
+        for line in get_signature().lines() {
+            text_buffer.write("\n// ");
+            text_buffer.write(line);
+        }
+
+        text_buffer.write("\n\n");
+        text_buffer.write(&CONTENT[..TAB_SIZE_IC.start_pattern()]);
+        TAB_SIZE_IC.write([format!("{tab_size}").as_str()], &mut text_buffer);
+        IMAGE_TEXT_PATH_IC.write([example_path.as_str()], &mut text_buffer);
+        OUTPUT_IMAGE_PATH_IC.write([format!("{}.jpg", example_name).as_str()], &mut text_buffer);
+        text_buffer
+            .write_tokens(&CONTENT[OUTPUT_IMAGE_PATH_IC.end_pattern()..BYTES_IC.start_pattern()]);
+        text_buffer.write("\n");
+        BYTES_IC.write(
+            [&octothorpes, "\"", image_str, "\"", &octothorpes],
+            &mut text_buffer,
+        );
+        text_buffer.write_tokens(
+            &CONTENT[BYTES_IC.end_pattern()..find_start_pattern(END_COPY_SECTION_PATTERN)],
+        );
+        text_buffer.write("\n");
+
+        write(example_path, text_buffer.bytes).map_err(Error::FailedToWriteExample)
+    }
+}
 
 const FONT_PATH: &str = "./assets/ubuntu-font-family-0.83/UbuntuMono-R.ttf";
 const IMAGE_PATH: &str = "./assets/Drawing_Hands_3x2.png";
 const EXAMPLE_NAME: &str = "drawing_hands";
-
-#[derive(Debug, Parser)]
-struct Args {
-    #[arg(short, long, default_value_t = FONT_PATH.into())]
-    font_path: String,
-
-    #[arg(short, long, default_value_t = IMAGE_PATH.into())]
-    image_path: String,
-
-    #[arg(short, long, default_value_t = EXAMPLE_NAME.into())]
-    example_name: String,
-
-    #[arg(short, long, default_value_t)]
-    run: bool,
-}
-
-fn main() {
-    let args: Args = Args::parse();
-
-    if let Err(error) =
-        ImageBytesData::try_write_example(&args.font_path, &args.image_path, &args.example_name)
-    {
-        eprintln!("Encountered error attempting to write example with args {args:#?}\n{error:#?}");
-    } else if args.run {
-        Command::new("cargo")
-            .args(["run", "--example", &args.example_name])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()
-            .ok();
-    }
-}
+const TAB_SIZE: usize = 4_usize;
 
 #[derive(Clone, Copy)]
 struct Vector {
@@ -128,11 +614,12 @@ impl<'a, F: Font> CharAlphaGridParams<'a, F> {
 
             self.rasterizer.for_each_pixel_2d(|x, y, alpha| {
                 alpha_sum += alpha;
-                char_alpha_grid.0[Cag::PIXEL_WIDTH * Self::invert_y(y as usize) + x as usize] =
+                char_alpha_grid.0
+                    [CharAlphaGrid::PIXEL_WIDTH * Self::invert_y(y as usize) + x as usize] =
                     (alpha * u8::MAX as f32) as u8;
             });
 
-            alpha_sum / Cag::PIXEL_AREA as f32
+            alpha_sum / CharAlphaGrid::PIXEL_AREA as f32
         } else {
             char_alpha_grid.0.fill(0_u8);
 
@@ -142,7 +629,7 @@ impl<'a, F: Font> CharAlphaGridParams<'a, F> {
 
     #[inline(always)]
     fn invert_y(y: usize) -> usize {
-        Cag::PIXEL_HEIGHT - y - 1_usize
+        CharAlphaGrid::PIXEL_HEIGHT - y - 1_usize
     }
 }
 
@@ -165,6 +652,7 @@ struct FontAlphaData {
     alpha_to_byte: AlphaToByte,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum FontAlphaDataError {
     IoError(IoError),
@@ -172,8 +660,6 @@ enum FontAlphaDataError {
     InvalidFont(InvalidFont),
     MissingGlyph(char),
     MissingHorAdvance(char),
-
-    #[allow(dead_code)]
     UnexpectedHorAdvance {
         code_point: char,
         expected: u16,
@@ -193,12 +679,16 @@ impl FontAlphaData {
         // `Font::h_advance_unscaled` uses `Face::glyph_hor_advance` under the hood, but it also
         // panics internally if the information isn't available, without a means to verify the
         // information is available.
-        for code_point in CagArr::PRINTABLE_RANGE.into_iter() {
-            let Some(glyph_id) = face.glyph_index(code_point) else { return Err(FadError::MissingGlyph(code_point)); };
+        for code_point in CharAlphaGridArr::PRINTABLE_RANGE {
+            let Some(glyph_id) = face.glyph_index(code_point) else {
+                return Err(FadError::MissingGlyph(code_point));
+            };
 
-            let Some(actual) = face.glyph_hor_advance(glyph_id) else { return Err(FadError::MissingHorAdvance(code_point)); };
+            let Some(actual) = face.glyph_hor_advance(glyph_id) else {
+                return Err(FadError::MissingHorAdvance(code_point));
+            };
 
-            if let Some(expected) = hor_advance.clone() {
+            if let Some(expected) = hor_advance {
                 if actual != expected {
                     return Err(FadError::UnexpectedHorAdvance {
                         code_point,
@@ -212,14 +702,15 @@ impl FontAlphaData {
         }
 
         let font: FontRef = FontRef::try_from_slice(&data).map_err(FadError::InvalidFont)?;
-        let mut rasterizer: Rasterizer = Rasterizer::new(Cag::PIXEL_WIDTH, Cag::PIXEL_HEIGHT);
+        let mut rasterizer: Rasterizer =
+            Rasterizer::new(CharAlphaGrid::PIXEL_WIDTH, CharAlphaGrid::PIXEL_HEIGHT);
         let offset: Vector = Vector {
             x: 0.0_f32,
             y: -face.descender() as f32,
         };
         let scale: Vector = Vector {
-            x: Cag::PIXEL_WIDTH as f32 / hor_advance.unwrap() as f32,
-            y: Cag::PIXEL_HEIGHT as f32 / face.units_per_em() as f32,
+            x: CharAlphaGrid::PIXEL_WIDTH as f32 / hor_advance.unwrap() as f32,
+            y: CharAlphaGrid::PIXEL_HEIGHT as f32 / face.units_per_em() as f32,
         };
         let mut params: CharAlphaGridParams<FontRef> = CharAlphaGridParams {
             font: &font,
@@ -229,12 +720,12 @@ impl FontAlphaData {
             c: Default::default(),
         };
 
-        let mut char_alpha_grid_arr: CagArr = CagArr::default();
+        let mut char_alpha_grid_arr: CharAlphaGridArr = CharAlphaGridArr::default();
 
         let mut alpha_char_pairs: Vec<(f32, char)> =
-            Vec::with_capacity(CagArr::PRINTABLE_LEN - 1_usize);
+            Vec::with_capacity(CharAlphaGridArr::PRINTABLE_LEN - 1_usize);
 
-        for (index, c) in CagArr::PRINTABLE_RANGE.into_iter().enumerate() {
+        for (index, c) in CharAlphaGridArr::PRINTABLE_RANGE.enumerate() {
             params.c = c;
             alpha_char_pairs.push((
                 params.init_char_alpha_grid(&mut char_alpha_grid_arr.0[index]),
@@ -290,31 +781,22 @@ struct TerminatingSequenceError {
     double_quote: RangeInclusive<u8>,
 }
 
-#[derive(Debug)]
-enum WriteExampleError {
-    InvalidExampleChar(char),
-    FailedToCreateDir(IoError),
-    FailedToReadMain(IoError),
-    ContentContainsNonAscii,
-    FailedToWriteExample(IoError),
-}
-
+#[allow(dead_code)]
 #[derive(Debug)]
 enum ImageBytesDataError {
-    FontAlphaDataError(FontAlphaDataError),
-    ImageError(ImageError),
-    TerminatingSequenceError(TerminatingSequenceError),
-    WriteExampleError(WriteExampleError),
+    FontAlphaData(FontAlphaDataError),
+    Image(ImageError),
+    TerminatingSequence(TerminatingSequenceError),
 }
 
 impl ImageBytesData {
-    const BLOCK_BYTE_WIDTH: usize = CagArr::BLOCK_BYTE_LEN;
+    const BLOCK_BYTE_WIDTH: usize = CharAlphaGridArr::BLOCK_BYTE_LEN;
     const BLOCK_BYTE_HEIGHT: usize = 16_usize;
     const LONG_BLOCK_LEN: usize = 12_usize;
     const SHORT_BLOCK_LEN: usize = 8_usize;
-    const FRAME_BLOCK_WIDTH: usize = CagArr::FRAME_BLOCK_LEN;
-    const FRAME_BYTE_WIDTH: usize = CagArr::FRAME_BYTE_LEN;
-    // const LINE_BYTE_WIDTH: usize = 448_usize;
+    const FRAME_BLOCK_WIDTH: usize = CharAlphaGridArr::FRAME_BLOCK_LEN;
+    const FRAME_BYTE_WIDTH: usize = CharAlphaGridArr::FRAME_BYTE_LEN;
+    const LINE_BYTE_WIDTH: usize = Self::FRAME_BYTE_WIDTH + 2_usize;
 
     fn try_get_gray_image<P: AsRef<Path>>(path: P) -> ImageResult<GrayImage> {
         let original: DynamicImage = open(path)?;
@@ -350,11 +832,7 @@ impl ImageBytesData {
 
         let candidates: Vec<&[u8]> = drawing
             .chunks_exact(drawing_byte_width)
-            .flat_map(|line| {
-                (0_usize..drawing_byte_width_minus_two)
-                    .into_iter()
-                    .map(|start| &line[start..])
-            })
+            .flat_map(|line| (0_usize..drawing_byte_width_minus_two).map(|start| &line[start..]))
             .filter(|candidate| candidate[..2_usize] == *shortest_terminating_sequence)
             .collect();
 
@@ -365,7 +843,6 @@ impl ImageBytesData {
             let mut invalid_candidates: Vec<usize> = Vec::new();
 
             (3_usize..terminating_sequence.len())
-                .into_iter()
                 .find(|octothorpes| {
                     let index: RangeTo<usize> = ..*octothorpes;
                     let terminating_sequence: &[u8] = &terminating_sequence[index];
@@ -373,7 +850,7 @@ impl ImageBytesData {
                     if !valid_candidates.iter_ones().any(|candidate_index| {
                         // Check if the candidate at the specified index is still valid
                         if candidates[candidate_index]
-                            .get(index.clone())
+                            .get(index)
                             .filter(|candidate| *candidate == terminating_sequence)
                             .is_some()
                         {
@@ -431,9 +908,9 @@ impl ImageBytesData {
         use ImageBytesDataError as IbdError;
 
         let font_alpha_data: FontAlphaData =
-            FontAlphaData::try_from_file_path(font_path).map_err(IbdError::FontAlphaDataError)?;
+            FontAlphaData::try_from_file_path(font_path).map_err(IbdError::FontAlphaData)?;
         let gray_image: GrayImage =
-            Self::try_get_gray_image(image_path).map_err(IbdError::ImageError)?;
+            Self::try_get_gray_image(image_path).map_err(IbdError::Image)?;
 
         Self::try_from_font_alpha_data_and_gray_image(
             &font_alpha_data.char_alpha_grid_arr,
@@ -449,13 +926,15 @@ impl ImageBytesData {
     ) -> Result<Self, ImageBytesDataError> {
         use ImageBytesData as Ibd;
 
-        const DRAWING_BYTE_LEN: usize = Cag::PIXEL_AREA * CagArr::PRINTABLE_LEN;
+        const DRAWING_BYTE_LEN: usize = CharAlphaGrid::PIXEL_AREA * CharAlphaGridArr::PRINTABLE_LEN;
         const DRAWING_BLOCK_LEN: usize = DRAWING_BYTE_LEN / Ibd::BLOCK_BYTE_WIDTH;
         const DRAWING_AND_PARITY_BYTE_LEN: usize = DRAWING_BYTE_LEN * 2_usize;
-        const IMAGE_BYTES_BYTE_LEN: usize = CagArr::padded_byte_len(
-            DRAWING_AND_PARITY_BYTE_LEN + CagArr::MANIFEST_BIT_LEN / Base64::BITS_PER_BYTE,
-        ) + CagArr::NEW_LINE_SLICE_LEN;
-        const PADDED_FRAME_BYTE_WIDTH: usize = Ibd::FRAME_BYTE_WIDTH + CagArr::NEW_LINE_SLICE_LEN;
+        const IMAGE_BYTES_BYTE_LEN: usize = CharAlphaGridArr::padded_byte_len(
+            DRAWING_AND_PARITY_BYTE_LEN
+                + CharAlphaGridArr::MANIFEST_BIT_LEN / Base64::BITS_PER_BYTE,
+        ) + CharAlphaGridArr::NEW_LINE_SLICE_LEN;
+        const PADDED_FRAME_BYTE_WIDTH: usize =
+            Ibd::FRAME_BYTE_WIDTH + CharAlphaGridArr::NEW_LINE_SLICE_LEN;
 
         let mut drawing: Vec<u8> = Vec::new();
         let mut parity: Vec<u8> = Vec::new();
@@ -477,15 +956,16 @@ impl ImageBytesData {
             let drawing: u8 = alpha_to_byte.0[drawing_luma.0[0_usize] as usize];
 
             *drawing_dest = drawing;
-            *parity = Cag::parity(char_alpha, drawing);
+            *parity = CharAlphaGrid::parity(char_alpha, drawing);
         }
 
         let drawing_byte_width: usize = gray_image.width() as usize;
         let octothorpes: usize =
             Self::try_get_octothorpes(&drawing, drawing_byte_width, alpha_to_byte)
-                .map_err(ImageBytesDataError::TerminatingSequenceError)?;
+                .map_err(ImageBytesDataError::TerminatingSequence)?;
 
-        let mut manifest: BitVec<u8, Lsb0> = BitVec::with_capacity(CagArr::MANIFEST_BIT_LEN);
+        let mut manifest: BitVec<u8, Lsb0> =
+            BitVec::with_capacity(CharAlphaGridArr::MANIFEST_BIT_LEN);
         let mut image_bytes_data: ImageBytesData = ImageBytesData {
             bytes: Vec::with_capacity(IMAGE_BYTES_BYTE_LEN),
             octothorpes,
@@ -497,7 +977,7 @@ impl ImageBytesData {
             if block_len % Self::FRAME_BLOCK_WIDTH == 0_usize {
                 image_bytes_data
                     .bytes
-                    .extend_from_slice(CagArr::NEW_LINE_SLICE);
+                    .extend_from_slice(CharAlphaGridArr::NEW_LINE_SLICE);
             }
 
             for value in if is_drawing {
@@ -555,7 +1035,7 @@ impl ImageBytesData {
             if image_bytes_data.bytes.len() % PADDED_FRAME_BYTE_WIDTH == 0_usize {
                 image_bytes_data
                     .bytes
-                    .extend_from_slice(CagArr::NEW_LINE_SLICE);
+                    .extend_from_slice(CharAlphaGridArr::NEW_LINE_SLICE);
             }
 
             image_bytes_data.bytes.push(manifest_byte);
@@ -563,7 +1043,7 @@ impl ImageBytesData {
 
         image_bytes_data
             .bytes
-            .extend_from_slice(CagArr::NEW_LINE_SLICE);
+            .extend_from_slice(CharAlphaGridArr::NEW_LINE_SLICE);
 
         Ok(image_bytes_data)
     }
@@ -577,105 +1057,6 @@ impl ImageBytesData {
         // only consist of bytes that match the regex pattern `[A-Za-z0-9+/]`, and the new line
         // slice is `b" \n"`, which is all valid ASCII, thus valid UTF8-encoded Unicode
         unsafe { from_utf8_unchecked(&self.bytes) }
-    }
-
-    fn write_example(&self, example_name: &str) -> Result<(), WriteExampleError> {
-        use WriteExampleError as Error;
-
-        if let Some(c) = example_name
-            .chars()
-            .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_'))
-        {
-            return Err(Error::InvalidExampleChar(c));
-        }
-
-        const EXAMPLES_PATH: &str = "./examples/";
-
-        create_dir_all(EXAMPLES_PATH).map_err(Error::FailedToCreateDir)?;
-
-        let main: String = read_to_string("./src/main.rs").map_err(Error::FailedToReadMain)?;
-
-        const CONTENT_STR: &str = concat!("mod ", "content ", "{");
-
-        let after_open_bracket: usize = main.find(CONTENT_STR).unwrap() + CONTENT_STR.len();
-        let start: usize = main[after_open_bracket..]
-            .find(|c: char| !c.is_whitespace())
-            .unwrap()
-            + after_open_bracket;
-
-        let mut brackets: usize = 1_usize;
-
-        let end: usize = main[start..]
-            .find(|c: char| {
-                if c == '}' {
-                    brackets -= 1_usize;
-
-                    brackets == 0_usize
-                } else {
-                    brackets += (c == '{') as usize;
-
-                    false
-                }
-            })
-            .unwrap()
-            + start;
-        let content: &str = &main[start..end];
-
-        if !content.is_ascii() {
-            return Err(Error::ContentContainsNonAscii);
-        }
-
-        const INPUT_TEXT_PATH: &str = r#"const INPUT_TEXT_PATH: &str = "";"#;
-        const OUTPUT_IMAGE_PATH: &str = r#"const OUTPUT_IMAGE_PATH: &str = "";"#;
-        const BYTES: &str = r#"const BYTES: &[u8] = br"";"#;
-
-        let input_text_path_pos: usize =
-            content.find(INPUT_TEXT_PATH).unwrap() + INPUT_TEXT_PATH.len() - 2_usize;
-        let output_image_path_pos: usize =
-            content.find(OUTPUT_IMAGE_PATH).unwrap() + OUTPUT_IMAGE_PATH.len() - 2_usize;
-        let bytes_start: usize = content.find(BYTES).unwrap() + BYTES.len() - 3_usize;
-        let bytes_end: usize = bytes_start + 2_usize;
-
-        let example_path: String = format!("{EXAMPLES_PATH}{example_name}.rs");
-        let octothorpes: String = self.octothorpes_string();
-
-        let mut contents: Vec<u8> =
-            // Loose calculation, since what actually gets written is subject to change
-            Vec::with_capacity(content.len() + self.bytes.len() + 2_usize * self.octothorpes);
-
-        macro_rules! write_contents {
-            ( $($str:expr,)* ) => {
-                $(
-                    contents.extend_from_slice($str.as_ref());
-                )*
-            };
-        }
-
-        write_contents!(
-            content[..input_text_path_pos],
-            example_path,
-            content[input_text_path_pos..output_image_path_pos],
-            format!("./output/{example_name}.jpg"),
-            content[output_image_path_pos..bytes_start],
-            octothorpes,
-            "\"",
-            self.bytes,
-            "\"",
-            octothorpes,
-            content[bytes_end..],
-        );
-
-        write(example_path, contents).map_err(Error::FailedToWriteExample)
-    }
-
-    fn try_write_example<P: AsRef<Path>>(
-        font_path: P,
-        image_path: P,
-        example_name: &str,
-    ) -> Result<(), ImageBytesDataError> {
-        Self::try_from_file_paths(font_path, image_path)?
-            .write_example(example_name)
-            .map_err(ImageBytesDataError::WriteExampleError)
     }
 }
 
@@ -725,297 +1106,46 @@ impl Parity for CharAlphaGrid {
     }
 }
 
-mod content {
-    pub use self::{CharAlphaGrid as Cag, CharAlphaGridArr as CagArr};
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(short, long, default_value_t = FONT_PATH.into())]
+    font_path: String,
 
-    use {
-        bitvec::{order::Lsb0, vec::BitVec, view::AsBits},
-        clap::Parser,
-        image::{GrayAlphaImage, ImageError, LumaA, Pixel},
-        std::{
-            alloc::{alloc_zeroed, handle_alloc_error, Layout},
-            fs::{create_dir_all, read_to_string},
-            io::Error as IoError,
-            mem::MaybeUninit,
-            ops::Range,
-            path::Path,
-            ptr::NonNull,
-        },
-    };
+    #[arg(short, long, default_value_t = IMAGE_PATH.into())]
+    image_path: String,
 
-    const INPUT_TEXT_PATH: &str = "";
-    const OUTPUT_IMAGE_PATH: &str = "";
-    const BYTES: &[u8] = br"";
+    #[arg(short, long, default_value_t = EXAMPLE_NAME.into())]
+    example_name: String,
 
-    #[derive(Debug, Parser)]
-    struct Args {
-        #[arg(short, long, default_value_t = INPUT_TEXT_PATH.into())]
-        input_text_path: String,
+    #[arg(short, long, default_value_t = TAB_SIZE)]
+    tab_size: usize,
 
-        #[arg(short, long, default_value_t = OUTPUT_IMAGE_PATH.into())]
-        output_image_path: String,
+    #[arg(short, long, default_value_t)]
+    run: bool,
+}
 
-        #[arg(short = 'w', long, default_value_t)]
-        min_pixel_width: usize,
+fn main() {
+    let args: Args = Args::parse();
 
-        #[arg(short = 'm', long, default_value_t)]
-        min_pixel_height: usize,
-
-        #[arg(short, long, default_value_t)]
-        tab_size: usize,
-    }
-
-    unsafe fn alloc_zeroed_non_null<T>() -> NonNull<T> {
-        let layout: Layout = Layout::new::<T>();
-
-        if let Some(non_null) = NonNull::new(alloc_zeroed(layout) as *mut T) {
-            non_null
-        } else {
-            handle_alloc_error(layout)
-        }
-    }
-
-    pub fn alloc_zeroed_box<T>() -> Box<T> {
-        // SAFETY: The calls to `alloc_zeroed_non_null` and `Box::from_raw` are safe because
-        // the value returned by the former has ownership immediately assumed by the latter:
-        // one allocation, one deallocation (when the value returned by this function is
-        // dropped)
-        unsafe { Box::from_raw(alloc_zeroed_non_null().as_ptr()) }
-    }
-
-    pub struct Base64;
-
-    impl Base64 {
-        pub const OFFSET_1: u8 = b'a' - 26_u8;
-        pub const OFFSET_2: u8 = 52_u8 - b'0';
-        pub const BITS_PER_BYTE: usize = 6_usize;
-
-        pub fn decode(value: u8) -> u8 {
-            match value {
-                b'A'..=b'Z' => value - b'A',
-                b'a'..=b'z' => value - Self::OFFSET_1,
-                b'0'..=b'9' => value + Self::OFFSET_2,
-                b'+' => 62_u8,
-                b'/' => 63_u8,
-                _ => {
-                    eprintln!("unexpected Base64 byte {value}");
-
-                    0_u8
-                }
-            }
-        }
-    }
-
-    #[derive(Clone, PartialEq)]
-    pub struct CharAlphaGrid(pub [u8; CharAlphaGrid::PIXEL_AREA]);
-
-    impl CharAlphaGrid {
-        pub const PIXEL_WIDTH: usize = 16_usize;
-        pub const PIXEL_HEIGHT: usize = 32_usize;
-        pub const PIXEL_AREA: usize = Self::PIXEL_WIDTH * Self::PIXEL_HEIGHT;
-        pub const BITS: u32 = 6_u32;
-        pub const MAX: u8 = ((1_u16 << Self::BITS) - 1_u16) as u8;
-        pub const SCALE: f32 = u8::MAX as f32 / Self::MAX as f32;
-
-        pub fn alpha(drawing: u8, parity: u8) -> u8 {
-            (((drawing & Self::MAX) ^ Base64::decode(parity)) as f32 * Self::SCALE).round() as u8
-        }
-    }
-
-    impl Default for CharAlphaGrid {
-        fn default() -> Self {
-            // SAFETY: `Self` is just an array of `u8`s, for which zeroed bytes are valid
-            unsafe { MaybeUninit::zeroed().assume_init() }
-        }
-    }
-
-    #[derive(PartialEq)]
-    pub struct CharAlphaGridArr(pub Box<[CharAlphaGrid; CagArr::PRINTABLE_LEN]>);
-
-    #[derive(Debug)]
-    pub enum CharAlphaGridArrPrintError {
-        FailedToReadTextFile(IoError),
-        NonAsciiChar(char),
-        FailedToSaveImageFile(ImageError),
-    }
-
-    impl CharAlphaGridArr {
-        pub const PRINTABLE_RANGE: Range<char> = ' '..'\x7F';
-        pub const PRINTABLE_LEN: usize = Self::PRINTABLE_RANGE.end as usize
-            - Self::PRINTABLE_RANGE.start as usize
-            // Add one so the information represented is an easier number to work with (96, not 95)
-            + 1_usize;
-        pub const BLOCK_BYTE_LEN: usize = 32_usize;
-        pub const FRAME_BLOCK_LEN: usize = 14_usize;
-        pub const FRAME_BYTE_LEN: usize = CagArr::BLOCK_BYTE_LEN * CagArr::FRAME_BLOCK_LEN;
-        pub const MANIFEST_BIT_LEN: usize =
-            Cag::PIXEL_AREA * CagArr::PRINTABLE_LEN * 2_usize / CagArr::BLOCK_BYTE_LEN;
-        pub const NEW_LINE_SLICE: &'static [u8] = b"\n ";
-        pub const NEW_LINE_SLICE_LEN: usize = CagArr::NEW_LINE_SLICE.len();
-
-        pub const fn padded_byte_len(byte_len: usize) -> usize {
-            byte_len + (byte_len / CagArr::FRAME_BYTE_LEN + 1_usize) * CagArr::NEW_LINE_SLICE_LEN
-        }
-
-        pub fn from_image_bytes(bytes: &[u8]) -> Self {
-            const MANIFEST_BYTE_LEN: usize =
-                CagArr::padded_byte_len(CagArr::MANIFEST_BIT_LEN / Base64::BITS_PER_BYTE);
-
-            let mut char_alpha_grids: Self = Self::default();
-            let mut bit_vec: BitVec<u8, Lsb0> = BitVec::with_capacity(Self::MANIFEST_BIT_LEN);
-
-            for manifest_byte in bytes[bytes.len() - MANIFEST_BYTE_LEN..].iter() {
-                if !Self::NEW_LINE_SLICE.contains(manifest_byte) {
-                    bit_vec.extend_from_bitslice(
-                        &[Base64::decode(*manifest_byte)].as_bits::<Lsb0>()
-                            [..Base64::BITS_PER_BYTE],
-                    );
-                }
-            }
-
-            let iter_bytes = |block_index| {
-                let byte_index: usize = Self::padded_byte_len(block_index * Self::BLOCK_BYTE_LEN);
-
-                bytes[byte_index..byte_index + Self::BLOCK_BYTE_LEN]
-                    .iter()
-                    .copied()
-            };
-
-            for ((drawing, parity), dest) in bit_vec
-                .iter_ones()
-                .flat_map(iter_bytes)
-                .zip(bit_vec.iter_zeros().flat_map(iter_bytes))
-                .zip(
-                    char_alpha_grids
-                        .0
-                        .iter_mut()
-                        .flat_map(|char_alpha_grid| char_alpha_grid.0.iter_mut()),
-                )
-            {
-                *dest = Cag::alpha(drawing, parity);
-            }
-
-            char_alpha_grids
-        }
-
-        pub fn print<P: AsRef<Path>>(
-            &self,
-            text_path: P,
-            image_path: P,
-            min_pixel_width: usize,
-            min_pixel_height: usize,
-            tab_size: usize,
-        ) -> Result<(), CharAlphaGridArrPrintError> {
-            use CharAlphaGridArrPrintError as Error;
-
-            const PIXEL_WIDTH: usize = Cag::PIXEL_WIDTH;
-            const PIXEL_HEIGHT: usize = Cag::PIXEL_HEIGHT;
-            const BLACK: LumaA<u8> = LumaA([0_u8, u8::MAX]);
-
-            let text: String = read_to_string(text_path).map_err(Error::FailedToReadTextFile)?;
-            let (pixel_width, pixel_height): (usize, usize) = text
-                .lines()
-                .try_fold((0_usize, 0_usize), |(width, height), line| {
-                    if let Some(non_ascii_char) = line.chars().find(|c| !c.is_ascii()) {
-                        Err(non_ascii_char)
-                    } else {
-                        Ok((width.max(line.len()), height + 1_usize))
-                    }
-                })
-                .map(|(width, height)| {
-                    (
-                        (width * PIXEL_WIDTH).max(min_pixel_width),
-                        (height * PIXEL_HEIGHT).max(min_pixel_height),
-                    )
-                })
-                .map_err(Error::NonAsciiChar)?;
-
-            let mut image = GrayAlphaImage::new(pixel_width as u32, pixel_height as u32);
-            const CHANNEL_COUNT: usize = LumaA::<u8>::CHANNEL_COUNT as usize;
-
-            for pixel in image.pixels_mut() {
-                *pixel = BLACK;
-            }
-
-            let mut indices: Vec<usize> = Vec::new();
-
-            for (index, line) in text.lines().enumerate() {
-                for byte in line.as_bytes().into_iter().copied() {
-                    if byte == b'\t' {
-                        for _ in 0_usize
-                            ..(indices.len() + tab_size) / tab_size * tab_size - indices.len()
-                        {
-                            indices.push(0_usize);
-                        }
-                    } else {
-                        indices
-                            .push(byte.saturating_sub(Self::PRINTABLE_RANGE.start as u8) as usize);
-                    }
-                }
-
-                let pixel_y_start: usize = index * PIXEL_HEIGHT;
-
-                for y in pixel_y_start..pixel_y_start + PIXEL_HEIGHT {
-                    let start: usize = y % PIXEL_HEIGHT * PIXEL_WIDTH;
-                    let alpha_range: Range<usize> = start..start + PIXEL_WIDTH;
-
-                    #[inline(always)]
-                    fn byte_index(width: usize, x: usize, y: usize) -> usize {
-                        (y * width + x) * CHANNEL_COUNT
-                    }
-
-                    for (pixel, alpha) in
-                        (*image)[byte_index(pixel_width, 0_usize, y)
-                            ..byte_index(pixel_width, indices.len() * PIXEL_WIDTH, y)]
-                            .chunks_exact_mut(CHANNEL_COUNT)
-                            .map(<LumaA<u8> as Pixel>::from_slice_mut)
-                            .zip(indices.iter().copied().flat_map(|index| {
-                                self.0[index].0[alpha_range.clone()].iter().copied()
-                            }))
-                    {
-                        pixel.blend(&LumaA([u8::MAX, alpha]));
-                    }
-                }
-
-                indices.clear();
-            }
-
-            image.save(image_path).map_err(Error::FailedToSaveImageFile)
-        }
-    }
-
-    impl Default for CharAlphaGridArr {
-        fn default() -> Self {
-            Self(alloc_zeroed_box())
-        }
-    }
-
-    #[allow(dead_code)]
-    fn main() {
-        let args: Args = Args::parse();
-
-        if args.output_image_path == OUTPUT_IMAGE_PATH {
-            create_dir_all("./output").ok();
-        }
-
-        if let Err(error) = CagArr::from_image_bytes(BYTES).print(
-            &args.input_text_path,
-            &args.output_image_path,
-            args.min_pixel_width,
-            args.min_pixel_height,
-            args.tab_size,
-        ) {
-            eprintln!("Encountered error attempting to print with args {args:#?}\n{error:#?}");
-        }
+    if let Err(error) = try_write_example(
+        &args.font_path,
+        &args.image_path,
+        &args.example_name,
+        args.tab_size,
+    ) {
+        eprintln!("Encountered error attempting to write example with args {args:#?}\n{error:#?}");
+    } else if args.run {
+        Command::new("cargo")
+            .args(["run", "--example", &args.example_name, "--", "-h", "10800"])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()
+            .ok();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, process::ChildStdout};
-
-    use image::EncodableLayout;
-
     use {
         super::*,
         lazy_static::lazy_static,
@@ -1078,7 +1208,7 @@ mod tests {
             op: F,
         ) {
             for (input, output) in iter.zip(dest.iter_mut()) {
-                *output = op(input as f32, Cag::SCALE).round() as u8
+                *output = op(input as f32, CharAlphaGrid::SCALE).round() as u8
             }
         }
 
@@ -1117,689 +1247,5 @@ mod tests {
             CharAlphaGridArr::from_image_bytes(&stage_c_6_bits.bytes);
 
         assert!(*stage_b_8_bits == stage_d_8_bits);
-    }
-
-    #[allow(dead_code, unused_imports)]
-    fn test_2023_01_27() {
-        use std::io::{Read, Write};
-        use std::process::Output;
-        use std::sync::{Arc, Mutex};
-
-        // let mut child = Command::new("nvim")
-        //     .arg("./src/main.rs")
-        //     // .args([
-        //     //     // "-c",
-        //     //     // "set t_ti= t_te= nomore",
-        //     //     // "-c",
-        //     //     // "hi Statement",
-        //     //     // "-e",
-        //     //     "./src/main.rs",
-        //     // ])
-        //     .stdin(Stdio::piped())
-        //     .stdout(Stdio::inherit())
-        //     .spawn()
-        //     .unwrap();
-
-        // let mut stdin = child.stdin.take().unwrap();
-        // // let mut stdout = child.stdout.take().unwrap();
-        // // std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // // let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // std::thread::spawn(move || {
-        //     std::thread::sleep(std::time::Duration::from_millis(500));
-        //     stdin.write_all(b"\x1B:q").ok();
-        //     // stdout
-        //     //     .read_to_end(&mut output.lock().as_mut().unwrap())
-        //     //     .ok();
-        // });
-
-        // // std::thread::sleep(std::time::Duration::from_millis(1000));
-        // // child.kill().ok();
-        // let Output { stdout, stderr, .. } = child.wait_with_output().unwrap();
-
-        let Output { stdout, stderr, .. } = Command::new("nvim")
-            .args([
-                "-c",
-                "%p",
-                // "-c",
-                // "set t_ti= t_te= nomore",
-                // "-c",
-                // "hi Statement",
-                // "-c",
-                // "q",
-                "./src/main.rs",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // .stdout(Stdio::inherit())
-            // .stderr(Stdio::inherit())
-            .output()
-            .unwrap();
-
-        let (stdout, stderr) = (
-            String::from_utf8(stdout).unwrap(),
-            String::from_utf8(stderr).unwrap(),
-        );
-
-        // let stdout = &stdout[stdout.rfind('\n').unwrap()..];
-
-        dbg!(&stdout);
-        println!("stdout:\n\"\"\"\n{stdout}\n\"\"\"\nstderr:\n\"\"\"\n{stderr}\n\"\"\"\n");
-        // println!("stderr:\n\"\"\"\n{stderr}\n\"\"\"\n");
-        dbg!(stdout.len(), stderr.len());
-    }
-
-    /// This works somewhat!!!
-    #[allow(dead_code)]
-    fn test_2023_01_28_17_39() {
-        use std::{
-            io::Write,
-            process::{Child, Output},
-            thread::sleep,
-            time::Duration,
-        };
-
-        let mut child: Child = Command::new("vim")
-            .arg("src/main.rs")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        sleep(Duration::from_millis(500));
-
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"\x1B:q!\x00")
-            .unwrap();
-
-        let Output { stdout, stderr, .. } = child.wait_with_output().unwrap();
-        let (stdout, stderr) = (
-            String::from_utf8(stdout).unwrap(),
-            String::from_utf8(stderr).unwrap(),
-        );
-
-        // println!("stdout:\n\"\"\"\n{stdout}\n\"\"\"\nstderr:\n\"\"\"\n{stderr}\n\"\"\"\n");
-        dbg!(stdout.len(), stderr.len(), &stdout, stderr);
-        println!("{}", &stdout[..stdout.rfind('\n').unwrap()]);
-    }
-
-    /// doesn't work, `File::read` blocks at the end of the file
-    #[allow(dead_code)]
-    fn test_2023_01_29_15_21() {
-        use std::{
-            io::{Read, Write},
-            process::{Child, ChildStdin, Output},
-            str::from_utf8,
-            thread::sleep,
-            time::Duration,
-        };
-
-        let mut child: Child = Command::new("vim")
-            .arg("examples/demo_ex.rs")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut out: Vec<u8> = Vec::new();
-        let mut stdin: ChildStdin = child.stdin.take().unwrap();
-        let mut stdout: ChildStdout = child.stdout.take().unwrap();
-        let mut append_lines = |lines: &mut Vec<String>| {
-            println!("append_lines called");
-            out.clear();
-
-            loop {
-                let out_len: usize = out.len();
-
-                const READ_LEN: usize = 256_usize;
-                const INTERRUPTED_SLEEP_DUR: Duration = Duration::from_millis(1_u64);
-
-                out.resize(out_len + READ_LEN, 0_u8);
-
-                match stdout.read(&mut out[out_len..]) {
-                    Ok(0_usize) => {
-                        out.truncate(0_usize);
-                        println!("read 0, breaking");
-
-                        break;
-                    }
-                    Ok(read_len) => {
-                        out.truncate(out_len + read_len);
-                        println!(
-                            "read {read_len} ({:?}), looping",
-                            // from_utf8(&out[out_len..])
-                            out.len()
-                        );
-                    }
-                    Err(error) if error.kind() == ErrorKind::Interrupted => {
-                        out.truncate(out_len);
-                        println!("interrupted, sleeping");
-                        sleep(INTERRUPTED_SLEEP_DUR);
-                    }
-                    Err(error) => {
-                        out.truncate(out_len);
-                        println!("error {error:?}, breaking");
-
-                        break;
-                    }
-                }
-            }
-
-            for line in from_utf8(&out).unwrap().lines() {
-                lines.push(line.into());
-            }
-        };
-
-        append_lines(&mut lines);
-
-        loop {
-            let lines_len: usize = lines.len();
-
-            dbg!(lines_len);
-
-            stdin.write_all(b"\x1B[B").unwrap();
-
-            sleep(Duration::from_millis(100));
-            append_lines(&mut lines);
-
-            if lines.len() == lines_len {
-                break;
-            }
-        }
-
-        child.kill().unwrap();
-
-        let Output { stdout, stderr, .. } = child.wait_with_output().unwrap();
-        let (stdout, stderr) = (
-            String::from_utf8(stdout).unwrap(),
-            String::from_utf8(stderr).unwrap(),
-        );
-
-        // println!("stdout:\n\"\"\"\n{stdout}\n\"\"\"\nstderr:\n\"\"\"\n{stderr}\n\"\"\"\n");
-        dbg!(stdout.len(), stderr.len(), stdout, stderr, lines.len());
-
-        for (index, line) in lines.into_iter().enumerate() {
-            println!("{index:04}: \"{line}\"");
-        }
-    }
-
-    /// doesn't work, but is iterated on for the next one
-    #[allow(dead_code)]
-    fn test_2023_01_30_22_08() {
-        use std::{
-            fs::File,
-            io::{Read, Write},
-            process::{Child, ChildStdin},
-            thread::sleep,
-            time::Duration,
-        };
-
-        let mut child: Child = Command::new("vim")
-            .arg("examples/demo_ex.rs")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin: ChildStdin = child.stdin.take().unwrap();
-
-        for _ in 0_usize
-            ..File::open("examples/demo_ex.rs")
-                .ok()
-                .map_or(0_usize, |file| {
-                    file.bytes()
-                        .filter_map(Result::ok)
-                        .filter(|byte| *byte == b'\n')
-                        .count()
-                })
-        {
-            stdin.write_all(b"\x1B[B").ok();
-            sleep(Duration::from_millis(30));
-        }
-
-        stdin.write_all(b"\x1B:q!\x00").ok();
-
-        let stdout: String = String::from_utf8(
-            child
-                .wait_with_output()
-                .ok()
-                .map_or_else(Vec::new, |output| output.stdout),
-        )
-        .unwrap_or_default();
-
-        println!("{stdout}");
-    }
-
-    /// This works! Todo: parametrize the file, catch case where the final read block fails (need
-    /// a worker and a watcher thread for this), delete .swp file
-    #[allow(dead_code)]
-    fn test_2023_01_30_23_05() {
-        use std::{
-            fs::File,
-            io::{Read, Write},
-            process::{Child, ChildStdin},
-            thread::sleep,
-            time::Duration,
-        };
-
-        let mut child: Child = Command::new("vim")
-            .arg("examples/demo_ex.rs")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin: ChildStdin = child.stdin.take().unwrap();
-        let mut stdout: ChildStdout = child.stdout.take().unwrap();
-
-        let (byte_count, line_count): (usize, usize) = File::open("./examples/demo_ex.rs")
-            .ok()
-            .map(|file| {
-                file.bytes().filter_map(Result::ok).fold(
-                    (0_usize, 0_usize),
-                    |(byte_count, line_count), byte| {
-                        (byte_count + 1_usize, line_count + (byte == b'\n') as usize)
-                    },
-                )
-            })
-            .unwrap_or_default();
-
-        for _ in 0_usize..line_count {
-            stdin.write_all(b"\x1B[B").ok();
-            // sleep(Duration::from_micros(1_000));
-        }
-
-        let full_block_read_len: usize = (1_usize
-            << (usize::BITS - byte_count.leading_zeros()).saturating_sub(1_u32))
-        .max(2_usize);
-
-        // This capacity is an underestimate, but it'll save allocations for a few orders of
-        // magnitude
-        let mut buf: Vec<u8> = Vec::with_capacity(byte_count);
-        let mut has_read_full_block: bool = false;
-
-        loop {
-            let buf_len: usize = buf.len();
-            let read_len: usize = full_block_read_len - (buf_len & (full_block_read_len - 1_usize));
-
-            buf.resize(buf_len + read_len, 0_u8);
-
-            match stdout.read(&mut buf[buf_len..]) {
-                Ok(0_usize) => {
-                    buf.truncate(buf_len);
-                    println!("read 0, breaking");
-
-                    break;
-                }
-                Ok(read_len) => {
-                    buf.truncate(buf_len + read_len);
-                    println!("read {read_len} ({:?}), looping", buf.len());
-
-                    if read_len == full_block_read_len {
-                        has_read_full_block = true
-                    } else if has_read_full_block {
-                        println!("  previously read full block, breaking");
-
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {
-                    buf.truncate(buf_len);
-                    println!("interrupted, sleeping");
-                    const INTERRUPTED_SLEEP_DUR: Duration = Duration::from_millis(1_u64);
-                    sleep(INTERRUPTED_SLEEP_DUR);
-                }
-                Err(error) => {
-                    buf.truncate(buf_len);
-                    println!("error {error:?}, breaking");
-
-                    break;
-                }
-            }
-        }
-
-        // sleep(Duration::from_millis(500));
-        child.kill().ok();
-
-        let (stdout, stderr) = (buf, Vec::new());
-        let (stdout, stderr) = (
-            String::from_utf8(stdout).unwrap(),
-            String::from_utf8(stderr).unwrap(),
-        );
-
-        dbg!(stdout.len(), stderr.len(), &stdout, stderr);
-        // println!("{}", &stdout[..stdout.rfind('\n').unwrap()]);
-    }
-
-    // Doesn't quite work, but maybe if the input and output alternate, with one thread for each
-    #[allow(dead_code)]
-    fn test_2023_02_01_22_50(file: &str) {
-        use std::{
-            fs::File,
-            io::{Read, Write},
-            process::{Child, ChildStdin},
-            sync::{
-                atomic::{AtomicU64, Ordering},
-                Arc, Mutex,
-            },
-            thread::{sleep, spawn},
-            time::{Duration, Instant},
-        };
-
-        let mut child: Child = Command::new("vim")
-            .arg(file)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin: ChildStdin = child.stdin.take().unwrap();
-        let mut stdout: ChildStdout = child.stdout.take().unwrap();
-
-        let (byte_count, line_count): (usize, usize) = File::open(file)
-            .ok()
-            .map(|file| {
-                file.bytes().filter_map(Result::ok).fold(
-                    (0_usize, 0_usize),
-                    |(byte_count, line_count), byte| {
-                        (byte_count + 1_usize, line_count + (byte == b'\n') as usize)
-                    },
-                )
-            })
-            .unwrap_or_default();
-
-        for _ in 0_usize..line_count {
-            stdin.write_all(b"\x1B[B").ok();
-            sleep(Duration::from_micros(1_000));
-        }
-
-        let full_block_read_len: usize = (1_usize
-            << (usize::BITS - byte_count.leading_zeros()).saturating_sub(1_u32))
-        .max(2_usize);
-
-        dbg!(full_block_read_len);
-
-        let start: Instant = Instant::now();
-        let now_nanos = move || (Instant::now() - start).as_nanos() as u64;
-
-        // This capacity is an underestimate, but it'll save allocations for a few orders of
-        // magnitude
-        struct ThreadData {
-            stdout_bytes: Mutex<Vec<u8>>,
-            update_time: AtomicU64,
-        }
-
-        let thread_data: Arc<ThreadData> = Arc::new(ThreadData {
-            stdout_bytes: Mutex::new(Vec::with_capacity(byte_count)),
-            update_time: AtomicU64::new(0_u64),
-        });
-
-        let worker_thread_data = thread_data.clone();
-
-        let worker = spawn(move || {
-            let mut has_read_full_block: bool = false;
-            let mut buf: Vec<u8> = Vec::with_capacity(full_block_read_len);
-
-            buf.resize(full_block_read_len, 0_u8);
-
-            loop {
-                worker_thread_data
-                    .update_time
-                    .store(now_nanos(), Ordering::Release);
-
-                match stdout.read(&mut buf[..]) {
-                    Ok(0_usize) => {
-                        println!("read 0, breaking");
-
-                        break;
-                    }
-                    Ok(read_len) => {
-                        let mut stdout = worker_thread_data.stdout_bytes.lock().unwrap();
-                        stdout.extend_from_slice(&buf[..read_len]);
-                        println!("read {read_len} ({:?}), looping", stdout.len());
-
-                        if read_len == full_block_read_len {
-                            has_read_full_block = true
-                        } else if has_read_full_block {
-                            println!("  previously read full block, breaking");
-
-                            break;
-                        }
-                    }
-                    Err(error) if error.kind() == ErrorKind::Interrupted => {
-                        println!("interrupted, sleeping");
-
-                        const INTERRUPTED_SLEEP_DUR: Duration = Duration::from_millis(1_u64);
-                        sleep(INTERRUPTED_SLEEP_DUR);
-                    }
-                    Err(error) => {
-                        println!("error {error:?}, breaking");
-
-                        break;
-                    }
-                }
-            }
-        });
-
-        const MAX_UPDATE_DUR: Duration = Duration::from_millis(5000);
-        const WATCHER_SLEEP_DUR: Duration = Duration::from_millis(500_u64);
-
-        while !worker.is_finished()
-            && Duration::from_nanos(now_nanos() - thread_data.update_time.load(Ordering::Acquire))
-                < MAX_UPDATE_DUR
-        {
-            sleep(WATCHER_SLEEP_DUR);
-        }
-
-        let worker_is_finished: bool = worker.is_finished();
-        let over_max_update_dur: bool =
-            Duration::from_nanos(now_nanos() - thread_data.update_time.load(Ordering::Acquire))
-                >= MAX_UPDATE_DUR;
-
-        dbg!(worker_is_finished, over_max_update_dur);
-
-        // Kill the child process to keep that from staying open
-        child.kill().ok();
-
-        // Sleep in case killing the child process now finishes the worker
-        sleep(Duration::from_millis(500));
-
-        dbg!(worker.is_finished());
-
-        let stdout = std::mem::take(&mut *thread_data.stdout_bytes.lock().unwrap());
-
-        dbg!(stdout.len(), String::from_utf8(stdout).ok());
-        // println!("{}", &stdout[..stdout.rfind('\n').unwrap()]);
-    }
-
-    fn test_2023_02_01(file: &str) {
-        use std::{
-            fs::File,
-            io::{Read, Write},
-            process::{Child, ChildStdin},
-            sync::{
-                atomic::{AtomicU64, Ordering},
-                Arc, Mutex,
-            },
-            thread::{sleep, spawn},
-            time::{Duration, Instant},
-        };
-
-        let mut child: Child = Command::new("vim")
-            // .args(["-c", "se noru bo=insertmode,esc", "-c", "set!"])
-            .args([
-                "-c",
-                "se noru bo=insertmode,esc,cursor ttyfast ttymouse=xterm",
-            ])
-            .arg(file)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin: ChildStdin = child.stdin.take().unwrap();
-        let mut stdout: ChildStdout = child.stdout.take().unwrap();
-
-        let (byte_count, _line_count): (usize, usize) = File::open(file)
-            .ok()
-            .map(|file| {
-                file.bytes().filter_map(Result::ok).fold(
-                    (0_usize, 0_usize),
-                    |(byte_count, line_count), byte| {
-                        (byte_count + 1_usize, line_count + (byte == b'\n') as usize)
-                    },
-                )
-            })
-            .unwrap_or_default();
-        let full_block_read_len: usize = (1_usize
-            << (usize::BITS - byte_count.leading_zeros()).saturating_sub(1_u32))
-        .max(2_usize);
-
-        dbg!(full_block_read_len);
-
-        // stdin.write_all(b"i").ok();
-        // sleep(Duration::from_millis(100_u64));
-        // stdin.write_all(b"\x1B").ok();
-
-        // Sleep so that the vim can render the initial view buffer
-        sleep(Duration::from_millis(500_u64));
-
-        let start: Instant = Instant::now();
-        let now_nanos = move || (Instant::now() - start).as_nanos() as u64;
-
-        // This capacity is an underestimate, but it'll save allocations for a few orders of
-        // magnitude
-        struct ThreadData {
-            stdout_bytes: Mutex<Vec<u8>>,
-            update_time: AtomicU64,
-        }
-
-        let thread_data: Arc<ThreadData> = Arc::new(ThreadData {
-            stdout_bytes: Mutex::new(Vec::with_capacity(byte_count)),
-            update_time: AtomicU64::new(0_u64),
-        });
-
-        let worker_thread_data = thread_data.clone();
-
-        let worker = spawn(move || {
-            let mut buf: Vec<u8> = Vec::with_capacity(full_block_read_len);
-
-            buf.resize(full_block_read_len, 0_u8);
-
-            loop {
-                match stdout.read(&mut buf[..]) {
-                    Ok(0_usize) => {
-                        println!("read 0, breaking");
-
-                        break;
-                    }
-                    Ok(read_len) => {
-                        if read_len == 1_usize && buf[0_usize] == b'\x07' {
-                            println!("read bell, breaking");
-
-                            break;
-                        }
-
-                        let mut stdout = worker_thread_data.stdout_bytes.lock().unwrap();
-                        stdout.extend_from_slice(&buf[..read_len]);
-
-                        if read_len <= 4_usize {
-                            println!(
-                                "read {read_len} ({:?}, {:?}), looping",
-                                stdout.len(),
-                                &stdout[stdout.len() - read_len..]
-                            );
-                        } else {
-                            println!("read {read_len} ({:?}), looping", stdout.len());
-                        }
-                    }
-                    Err(error) if error.kind() == ErrorKind::Interrupted => {
-                        println!("interrupted, sleeping");
-
-                        const INTERRUPTED_SLEEP_DUR: Duration = Duration::from_millis(1_u64);
-                        sleep(INTERRUPTED_SLEEP_DUR);
-                    }
-                    Err(error) => {
-                        println!("error {error:?}, breaking");
-
-                        break;
-                    }
-                }
-
-                worker_thread_data
-                    .update_time
-                    .store(now_nanos(), Ordering::Release);
-            }
-        });
-
-        let mut loop_watcher = |send_down: bool| {
-            const MAX_UPDATE_DUR: Duration = Duration::from_millis(100_u64);
-            const WATCHER_SLEEP_DUR: Duration = Duration::from_millis(200_u64);
-
-            // let mut prev_update_time: u64 = 0_u64;
-
-            loop {
-                if worker.is_finished() {
-                    break;
-                }
-
-                let update_time: u64 = thread_data.update_time.load(Ordering::Acquire);
-
-                if update_time != 0_u64
-                    && Duration::from_nanos(now_nanos() - update_time) > MAX_UPDATE_DUR
-                {
-                    if !send_down
-                    /* || update_time == prev_update_time */
-                    {
-                        break;
-                    }
-
-                    // prev_update_time = update_time;
-                    stdin.write_all(b"\x1B[B").ok();
-                }
-
-                sleep(WATCHER_SLEEP_DUR);
-            }
-        };
-
-        // First loop the watcher until the worker reaches the end of the initial display
-        loop_watcher(false);
-
-        // Then loop the watcher pressing down. The worker should receive a bell eventually,
-        // at which point the worker will be finished and the watcher will end its loop
-        loop_watcher(true);
-
-        println!(
-            "is worker finished before killing child? {}",
-            worker.is_finished()
-        );
-
-        // Kill the child process to keep that from staying open
-        child.kill().ok();
-
-        // Sleep in case killing the child process now finishes the worker
-        sleep(Duration::from_millis(500));
-
-        println!(
-            "is worker finished after killing child? {}",
-            worker.is_finished()
-        );
-
-        let stdout = std::mem::take(&mut *thread_data.stdout_bytes.lock().unwrap());
-
-        dbg!(stdout.len());
-
-        let mut file: std::fs::File = File::create("output/vim_out.txt").unwrap();
-
-        let stdout_string: String = format!("{:?}", String::from_utf8(stdout).unwrap_or_default());
-
-        file.write(stdout_string.as_bytes()).unwrap();
-        // println!("{}", &stdout[..stdout.rfind('\n').unwrap()]);
-    }
-
-    #[test]
-    fn test_vim_io() {
-        test_2023_02_01("./examples/demo_ex.rs");
     }
 }
