@@ -1,6 +1,6 @@
-/.ignore
-/target
-/assets
+/assets/*
+!/assets/Drawing_Hands_3x2.png
+!/assets/drawing_hands_small.jpg
 /examples
-!/examples/test_into_tokens.rs
 /output
+/target

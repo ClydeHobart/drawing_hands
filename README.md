@@ -1,12 +1,45 @@
 # `drawing_hands`
 
+![Example output of drawing_hands](assets/drawing_hands_small.jpg)
+
 ## Installation
 
-TODO
+1. Download the [Ubuntu Font Family](https://design.ubuntu.com/font).
+2. Unzip the Ubuntu Font Family within the `assets/` directory so that `assets/ubuntu-font-family-0.83/UbuntuMono-R.ttf` is a valid path.
+3. Install [`FIGlet`](http://www.figlet.org/). My command line prompted me with a variety of commands to use to install this package/executable.
+4. Install [`vim`](https://www.vim.org/). I doubt you don't already have it installed.
 
 ## Execution
 
-TODO
+The easiest command to execute the full program is `cargo run -- -r`. I recommend reading the Explanation section for better context on the usage parameters.
+
+### `main.rs`
+
+**Usage:** `drawing_hands [OPTIONS]`
+
+**Options:**
+
+* `-f`, `--font-path <FONT_PATH>` (default: `./assets/ubuntu-font-family-0.83/UbuntuMono-R.ttf`). This works best as a mono-spaced font, where each character is as close to twice as tall as it is wide as possible. When encoding the font into the literal, each printable ASCII character of the font is converted into a 16x32 greyscale image, with 6 bits of luminance/alpha.
+* `-i`, `--image-path <IMAGE_PATH>` (default: `./assets/Drawing_Hands_3x2.png`). The image to convert into ASCII art for the big literal.
+* `-e`, `--example-name <EXAMPLE_NAME>` (default: `drawing_hands`). The output program will be created as `./examples/<EXAMPLE_NAME>.rs`.
+* `-t`, `--tab-size <TAB_SIZE>` (default: `4`). This will be the tab size that `drawing_hands.rs` has in its `TAB_SIZE` constant, used to keep track of positions of non-whitespace text following tab characters.
+* `-r`, `--run`. This automatically runs `drawing_hands.rs` after generating it.
+* `-h`, `--help`. Print help.
+
+### `drawing_hands.rs`
+
+**Usage:** `drawing_hands [OPTIONS]`
+
+**Options:**
+
+* `-i`, `--input-text-path <INPUT_TEXT_PATH>` (default: `./examples/drawing_hands.rs`). The path to a text-based file to open up in `vim`.
+* `-o`, `--output-image-path <OUTPUT_IMAGE_PATH>` (default: `./output/drawing_hands.jpg`). The output image file to produce.
+* `-w`, `--min-pixel-width <MIN_PIXEL_WIDTH>` (default: `0`). The minimum pixel width of the output image file.
+* `-h`, `--min-pixel-height <MIN_PIXEL_HEIGHT>` (default: `0`). The minimum pixel height of the output image file.
+* `-t`, `--tab-size <TAB_SIZE>` (default: `4`). The tab size to use to keep track of positions of non-whitespace text following tab characters.
+* `-d`, `--debug`. This will produce some debug files containing the (text, position), (text, color), and (text, position, color) ordered tuple lists.
+* `-s`, `--skip-print`. Used in conjunction with `-d`, this will skip the image printing process. This is useful for iterating on code that's used to produce the list of (text, position, color) ordered trios.
+* `--help`. Print help.
 
 ## Background
 

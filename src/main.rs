@@ -144,7 +144,28 @@ mod parse {
 
     #[test]
     fn test_into_tokens() {
-        const TEST_INTO_TOKENS: &str = include_str!("../examples/test_into_tokens.rs");
+        const TEST_INTO_TOKENS: &str = r#"fn main() {
+    println!("this is a literal inside a macro inside a func");
+
+    let x: i32 = 1;
+
+    dbg!(x);
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn some_test_0() {
+        let this_is_a_really_long_variable_name: i32 = 999999;
+
+        let my_str = "this is a another str as well as the one in main()";
+
+        println!("{my_str} {this_is_a_really_long_variable_name}");
+
+        println!("{} {} {}", "a", "b", "c");
+    }
+}
+"#;
 
         assert_eq!(
             into_tokens(TEST_INTO_TOKENS),
