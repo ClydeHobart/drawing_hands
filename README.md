@@ -53,7 +53,7 @@ I drew inspiration from a few works, including
 
 ## Explanation
 
-This project consists of three programs, `main.rs`, `content.rs`, and `drawing_hands.rs`
+This project consists of three programs, `main.rs`, `content.rs`, and `drawing_hands.rs`. Together, they can produce a file that can print an image of itself as rendered in `vim` at a resolution high enough for a 24"x32" poster.
 
 ### `main.rs`
 
@@ -69,6 +69,5 @@ With all the functional code of `content.rs`, albeit it condensed into a much le
 
 ## Shortcomings
 
-* testing?
-
-TODO
+* My testing of this project leaves a lot to be desired. I'm sure there are some `vim` settings that make this fail in mysterious ways. I have tested removing `FIGlet` and verifying that the fallback text prints correctly.
+* This is limited to printing files composed entirely of ASCII text.
